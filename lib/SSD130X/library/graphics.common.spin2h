@@ -1,0 +1,483 @@
+{
+    --------------------------------------------
+    Filename: graphics.common.spin2h
+    Author: Jesse Burt
+    Description: Generic bitmap-oriented graphics rendering routines (P2 version)
+    Copyright (c) 2022
+    Started May 19, 2019
+    Updated Dec 30, 2022
+    See end of file for terms of use.
+    --------------------------------------------
+}
+
+#include "terminal.common.spin2h"               ' for PrintF(), Str(), etc
+
+CON
+
+    { character attributes }
+    DRAWBG  = (1 << 0)
+
+VAR
+
+    { display buffer and dimensions }
+    long _ptr_drawbuffer
+    long _buff_sz
+    long _bytesperln
+    long _disp_width, _disp_height, _disp_xmax, _disp_ymax
+
+    { current draw color }
+    long _fgcolor, _bgcolor
+
+    { font parameters }
+    long _char_attrs
+    long _font_width, _font_height, _font_addr, _fnt_scl
+    word _charpx_xmax, _charpx_ymax
+    word _charpx_x, _charpx_y
+    byte _charcell_w, _charcell_h
+    byte _charcell_xmax, _charcell_ymax
+    byte _char_hspace, _char_vspace
+
+PUB bgcolor(col): curr_clr
+' Set background color for subsequent drawing
+    return _bgcolor := col
+
+#ifndef GFX_DIRECT
+PUB bitmap(ptr_bmap, xs, ys, bm_wid, bm_lns) | offs
+' Copy a bitmap to the display buffer
+'   ptr_bmap: pointer to bitmap data
+'   (xs, ys): upper-left corner of bitmap
+'   bm_wid: width of bitmap, in pixels
+'   bm_lns: number of lines in bitmap
+    repeat
+        ' calc offset from framebuffer and bitmap start,
+        '   then copy the bitmap one line at a time,
+        '   using the display's defined native word size
+        offs := ((ys++ * _bytesperln) + xs)     ' increment Y start
+        MEMMV_NATIVE(_ptr_drawbuffer+offs <# _ptr_drawbuffer+_buff_sz, {
+}       ptr_bmap+offs, bm_wid)
+    while bm_lns--                              ' loop if there're more lines
+#endif
+
+#ifndef GFX_DIRECT
+PUB box(x0, y0, x1, y1, color, filled=FALSE) | x, y
+' Draw a box
+'   x0, y0: Start coordinates
+'   x1, y1: End coordinates
+'   color:  box color
+'   filled: Flag to set whether to fill the box or not (default: no)
+    case filled
+        FALSE:
+            repeat x from x0 to x1
+                plot(x, y0, color)
+                plot(x, y1, color)
+            repeat y from y0 to y1
+                plot(x0, y, color)
+                plot(x1, y, color)
+        TRUE:
+#ifdef 1BPP
+            repeat y from y0 to y1
+                repeat x from x0 to x1
+                    plot(x, y, color)
+#else
+            if (x0 >= 0) and (x0 <= _disp_xmax) and (y0 >= 0) and {
+}           (y0 <= _disp_ymax) and (x1 >= 0) and (x1 <= _disp_xmax) and {
+}           (y1 >= 0) and (y1 <= _disp_ymax)
+#ifdef GFX_DIRECT
+            repeat y from y0 to y1
+                repeat x from x0 to x1
+                    plot(x, y, color)
+#else
+                x := abs(x1-x0)+1
+                if x1 < x0
+                    repeat y from y0 to y1
+                        memfill(x1, y, color, x)
+                else
+                    repeat y from y0 to y1
+                        memfill(x0, y, color, x)
+            else
+                return FALSE
+#endif
+#endif
+#endif
+
+#ifndef GFX_DIRECT
+PUB tx = putchar
+PUB char = putchar
+PUB putchar(ch) | glyph_col, glyph_row, xs, ys, xe, ye, last_glyph_col, last_glyph_row, glyph, char_ht, char_wid
+' Write a character to the display
+    last_glyph_col := _font_width-1             ' last column of pixels in font
+    last_glyph_row := _font_height-1            '   definition
+    char_wid := _charcell_w * _fnt_scl          ' scaled character dimensions
+    char_ht := _charcell_h * _fnt_scl           '
+
+    case ch
+        LF:                                     ' line feed
+            _charpx_y += char_ht                ' increment row by one char
+            if _charpx_y > _charpx_ymax         ' if last row reached,
+                _charpx_y -= char_ht            '   don't go further; instead,
+                repeat char_ht                  '   scroll up one text row
+                    scrollup(0, 0, _disp_xmax, _disp_ymax)
+        CR:                                     ' carriage return
+            _charpx_x := 0
+        32..127:                                ' printable characters
+            ch <<= 3                            ' char position in font table
+            case _fnt_scl
+                0, 1:                           ' no scaling applied
+                    repeat glyph_col from 0 to last_glyph_col
+                        xs := _charpx_x + glyph_col  ' x-coord to draw dot from font
+                        glyph := ch + glyph_col ' point to current glyph data
+                        repeat glyph_row from 0 to last_glyph_row
+                            if byte[_font_addr][glyph] & decod(glyph_row)
+                                plot(xs, _charpx_y + glyph_row, _fgcolor)
+                            else
+                                if (_char_attrs & DRAWBG)
+                                    plot(xs, _charpx_y + glyph_row, _bgcolor)
+                2..8:                           ' scale 2..8x
+                    repeat glyph_col from 0 to last_glyph_col
+                        xs := _charpx_x + (glyph_col * _fnt_scl)
+                        xe := xs + _fnt_scl
+                        glyph := ch + glyph_col ' offs. in glyph definition
+                        repeat glyph_row from 0 to last_glyph_row
+                            ys := _charpx_y + (glyph_row * _fnt_scl)
+                            ye := ys + _fnt_scl
+                            if byte[_font_addr][glyph] & decod(glyph_row)
+                                box(xs, ys, xe, ye, _fgcolor, true)
+                            else
+                                if (_char_attrs & DRAWBG)
+                                    box(xs, ys, xe, ye, _bgcolor, true)
+
+            _charpx_x += char_wid               ' inc column after rendering
+            if _charpx_x > _charpx_xmax         ' if last column reached,
+                _charpx_x := 0                  '   return to col 0 and go to
+                _charpx_y += char_ht            '   the next row
+            if _charpx_y > _charpx_ymax         ' if last row is reached,
+                _charpx_y -= char_ht            '   stay there and scroll up
+                repeat char_ht                  '   the display
+                    scrollup(0, 0, _disp_xmax, _disp_ymax)
+#endif
+
+PUB charattrs = char_attrs
+PUB char_attrs(attrs)
+' Set character attributes
+    _char_attrs := attrs
+
+PUB circle(x0, y0, radius, color, filled=FALSE) | x, y, err, cdx, cdy, cht
+' Draw a circle
+'   x0, y0: Coordinates
+'   radius: Circle radius
+'   color: Color to draw circle
+'   filled: fill the circle (0: no, nonzero: yes, default: no)
+    case filled
+        FALSE:
+            x := radius - 1
+            y := 0
+            cdx := 1
+            cdy := 1
+            err := cdx - (radius << 1)
+
+            repeat while (x >= y)
+                plot(x0 + x, y0 + y, color)
+                plot(x0 + y, y0 + x, color)
+                plot(x0 - y, y0 + x, color)
+                plot(x0 - x, y0 + y, color)
+                plot(x0 - x, y0 - y, color)
+                plot(x0 - y, y0 - x, color)
+                plot(x0 + y, y0 - x, color)
+                plot(x0 + x, y0 - y, color)
+
+                if (err <= 0)
+                    y++
+                    err += cdy
+                    cdy += 2
+
+                if (err > 0)
+                    x--
+                    cdx += 2
+                    err += cdx - (radius << 1)
+        other:
+            repeat x from -radius to radius
+                cht := sqrt((radius * radius) - (x * x))
+                repeat y from -cht to cht-1
+                    plot(x0 + x, y0 + y, color)
+
+#ifndef GFX_DIRECT
+PUB copy(sx, sy, ex, ey, dx, dy) | x, y, tmp
+' Copy rectangular region at (sx, sy, ex, ey) to (dx, dy)
+    repeat y from sy to ey
+        repeat x from sx to ex
+            tmp := point(x, y)
+            plot((dx + x)-sx, (dy + y)-sy, tmp)
+
+PUB cut(sx, sy, ex, ey, dx, dy) | x, y, tmp
+' Copy rectangular region at (sx, sy, ex, ey) to (dx, dy)
+'   Subsequently clears original region (sx, sy, ex, ey) to background color
+    repeat y from sy to ey
+        repeat x from sx to ex
+            tmp := point(x, y)
+            plot((dx + x)-sx, (dy + y)-sy, tmp)             ' Copy to destination region
+            plot(x, y, _bgcolor)                            ' Cut the original region
+#endif
+
+PUB fgcolor(col): curr_clr
+' Set foreground color of subsequent drawing operations
+    return _fgcolor := col
+
+PUB fontaddress = font_addr
+PUB font_addr(addr): curr_addr
+' Set address of font definition
+    case addr
+        $0004..$7FFFF:
+            _font_addr := addr
+        OTHER:
+            return _font_addr
+
+PUB fontheight = font_height
+PUB font_height(): curr_ht
+' Return the set font height
+    return _font_height
+
+PUB fontscale = font_scl
+PUB font_scl(fntscale): curr_scl
+' Set font rendering scale factor
+'   Valid values: 1..8
+'   Any other value returns the current scale
+    case fntscale
+        1..8:
+            _fnt_scl := fntscale
+        other:
+            return _fnt_scl
+
+PUB fontsize = font_sz
+PUB font_sz(width, height)
+' Set expected dimensions of font glyphs, in pixels
+'   NOTE: This doesn't have to be the same as the size of the font glyphs.
+'       e.g., if you have a 5x8 font, you may want to set the width to 6 or 8.
+'       This will affect the number of text columns
+    _font_width := width
+    _font_height := height
+    _charcell_w := (_font_width + _char_hspace) ' calc overall character cell
+    _charcell_h := (_font_height + _char_vspace)'   dims (font size + spacing)
+    _charpx_xmax := (_disp_width - _charcell_w) ' calc maximum x, y character
+    _charpx_ymax := (_disp_height - _charcell_h)'   pixel position
+    _charcell_xmax := (_disp_width / _charcell_w)
+    _charcell_ymax := (_disp_height / _charcell_h)
+
+PUB fontspacing = font_spacing
+PUB font_spacing(h, v)
+' Set spacing between character cells (horizontally, vertically)
+    _char_hspace := h
+    _char_vspace := v
+
+PUB fontwidth = font_width
+PUB font_width(): curr_wid
+' Return the set font width
+    return _font_width
+
+#ifndef GFX_DIRECT
+PUB line(x1, y1, x2, y2, c) | sx, sy, ddx, ddy, err, e2
+' Draw line from x1, y1 to x2, y2, in color c
+    if (x1 == x2) or (y1 == y2)
+        if (x1 == x2)                           ' draw vertical line
+            repeat sy from y1 to y2
+                plot(x1, sy, c)
+        if (y1 == y2)                           ' draw horizontal line
+            repeat sx from x1 to x2
+                plot(sx, y1, c)
+    else                                        ' draw diag. line (Bresenham)
+        ddx := abs(x2-x1)
+        ddy := abs(y2-y1)
+        err := ddx-ddy
+
+        sx := -1
+        if (x1 < x2)
+            sx := 1
+
+        sy := -1
+        if (y1 < y2)
+            sy := 1
+
+        repeat until ((x1 == x2) AND (y1 == y2))
+            plot(x1, y1, c)
+            e2 := err << 1
+
+            if e2 > -ddy
+                err -= ddy
+                x1 += sx
+
+            if e2 < ddx
+                err += ddx
+                y1 += sy
+#endif
+
+PUB position = pos_xy
+PUB pos_xy(x, y)
+' Set text draw position, in character-cell col and row
+    x := 0 #> x <# _charcell_xmax               ' clamp to min/max coordinates
+    y := 0 #> y <# _charcell_ymax
+    _charpx_x := (x * _charcell_w) * _fnt_scl   ' calc pixel position:
+    _charpx_y := (y * _charcell_h) * _fnt_scl   ' char cell coords * font dims
+
+PUB r5g6b5_rgb565(r, g, b): rgb565
+' Return 16-bit color in RGB565 format, given red (5), green (6), blue (5) components
+    return ((r << 11) | (g << 5) | b)
+
+PUB rgbW8888_RGB32(r, g, b, w): rgb32
+' Return 32-bit long from discrete Red, Green, Blue, White color components (values 0..255)
+    rgb32.byte[3] := r
+    rgb32.byte[2] := g
+    rgb32.byte[1] := b
+    rgb32.byte[0] := w
+
+PUB rgbw8888_rgb32_brightness(r, g, b, w, level): rgb32
+' Return 32-bit long from discrete Red, Green, Blue, White color components
+'   and clamp all color channels to maximum level or brightness
+'   Valid values:
+'       r, g, b, w: 0..255
+'       level: 0..100 (%)
+    if (level <= 0)
+        return 0
+    elseif (level >= 255)
+        return RGBW8888_RGB32(r, g, b, w)
+    else
+        r := r * level / 255                    ' Apply level to RGBW
+        g := g * level / 255
+        b := b * level / 255
+        w := w * level / 255
+        return RGBW8888_RGB32(r, g, b, w)
+
+PUB rgb565_r5(rgb565): r5
+' Isolate 5-bit red component of 16-bit RGB565 color
+    return ((rgb565 & $F800) >> 11)
+
+PUB rgb565_g5(rgb565): g5
+' Isolate 6-bit green component of 16-bit RGB565 color
+    return ((rgb565 & $07E0) >> 5)
+
+PUB rgb565_b5(rgb565): b5
+' Isolate 5-bit blue component of 16-bit RGB565 color
+    return (rgb565 & $001F)
+
+PUB rgb565_r8(rgb565): r8
+' Isolate red component of 16-bit RGB565 color and return value scaled to 8-bit range
+    return (((rgb565 & $F800) >> 11) * 527 + 23 ) >> 6
+
+PUB rgb565_g8(rgb565): g8
+' Isolate green component of 16-bit RGB565 color and return value scaled to 8-bit range
+    return (((rgb565 & $7E0) >> 5)  * 259 + 33 ) >> 6
+
+PUB rgb565_b8(rgb565): b8
+' Isolate blue component of 16-bit RGB565 color and return value scaled to 8-bit range
+    return ((rgb565 & $1F) * 527 + 23 ) >> 6
+
+#ifndef GFX_DIRECT
+PUB scale(sx, sy, ex, ey, offsx, offsy, size) | x, y, dx, dy, in
+' Scale a region of the display up by size
+    repeat y from sy to ey
+        repeat x from sx to ex
+            in := point(x, y)
+            dx := offsx + (x*size)-(sx*size)
+            dy := offsy + (y*size)-(sy*size)
+            box(dx, dy, dx + size, dy + size, in, TRUE)
+#endif
+
+#ifndef GFX_DIRECT
+PUB scrolldown = scroll_down
+PUB scroll_down(sx, sy, ex, ey) | scr_width, src, dest, x, y
+' Scroll a region of the display down by 1 pixel
+    scr_width := ex-sx
+    repeat y from ey-1 to sy
+#ifdef 1BPP
+        ' use Copy() for monochrome display types, until a more efficient
+        '   method can be devised
+        copy(sx, y, ex, y, sx, y+1)
+#else
+        src := sx + (y * _disp_width) * BYTESPERPX
+        dest := sx + ((y+1) * _disp_width) * BYTESPERPX
+        MEMMV_NATIVE(_ptr_drawbuffer + dest, _ptr_drawbuffer + src, scr_width)
+#endif
+
+PUB scrollleft = scroll_left
+PUB scroll_left(sx, sy, ex, ey) | scr_width, src, dest, y, yoffs
+' Scroll a region of the display left by 1 pixel
+    scr_width := ex-sx
+    repeat y from sy to ey
+#ifdef 1BPP
+        copy(sx, y, ex, y, sx-1, y)
+#else
+        yoffs := (y * _disp_width)
+        src := (sx + yoffs) * BYTESPERPX
+        dest := ((0 #> (sx-1)) + yoffs) * BYTESPERPX
+        MEMMV_NATIVE(_ptr_drawbuffer+dest, _ptr_drawbuffer+src, scr_width)
+#endif
+
+PUB scrollright = scroll_right
+PUB scroll_right(sx, sy, ex, ey) | scr_width, src, dest, y, yoffs
+' Scroll a region of the display right by 1 pixel
+    scr_width := ex-sx
+    repeat y from sy to ey
+#ifdef 1BPP
+        copy(sx, y, ex, y, sx+1, y)
+#else
+        yoffs := (y * _disp_width)
+        src := (sx + yoffs) * BYTESPERPX
+        dest := (((sx+1) <# _disp_width) + yoffs) * BYTESPERPX
+        MEMMV_NATIVE(_ptr_drawbuffer + dest, _ptr_drawbuffer + src, scr_width)
+#endif
+
+PUB scrollup = scroll_up
+PUB scroll_up(sx, sy, ex, ey) | scr_width, src, dest, x, y
+' Scroll a region of the display up by 1 pixel
+    scr_width := ex-sx
+    repeat y from sy+1 to ey
+#ifdef 1BPP
+        copy(sx, y, ex, y, sx, y-1)
+#else
+        src := sx + (y * _disp_width) * BYTESPERPX
+        dest := sx + ((y-1) * _disp_width) * BYTESPERPX
+        MEMMV_NATIVE(_ptr_drawbuffer + dest, _ptr_drawbuffer + src, scr_width)
+#endif
+#endif
+
+PUB set_dims(width, height)
+' Set display dimensions
+'   width: width of display (X-axis) in pixels
+'   height: height of display (Y-axis) in pixels
+    _disp_width := width
+    _disp_height := height
+    _disp_xmax := _disp_width - 1
+    _disp_ymax := _disp_height - 1
+
+    { update the buffer size, and the bytes per line }
+    _buff_sz := (_disp_width * _disp_height) * BYTESPERPX
+    _bytesperln := _disp_width * BYTESPERPX
+
+PUB textcols = text_cols
+PUB text_cols(): cols
+' Returns number of displayable text columns, based on set display width, font width, and scale
+    return (_disp_width / _charcell_w) / _fnt_scl
+
+PUB textrows = text_rows
+PUB text_rows(): rows
+' Returns number of displayable text rows, based on set display height, font height, and scale
+    return (_disp_height / _charcell_h) / _fnt_scl
+
+DAT
+{
+Copyright 2022 Jesse Burt
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
+OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+}
+

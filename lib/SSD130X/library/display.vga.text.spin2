@@ -1,0 +1,1176 @@
+{
+    --------------------------------------------
+    Filename: display.vga.text.spin2
+    Author: Eric Smith
+    Modified by: Jesse Burt
+    Description: Tiling VGA text driver
+    Started Nov 13, 2019
+    Updated Dec 17, 2022
+    See end of file for terms of use.
+    --------------------------------------------
+}
+
+{
+'******************************
+'*  VGA tiled image driver
+'******************************
+
+Runs in its own COG. See README.txt for theory of operation.
+
+Two variants are provided: an 8 bit palette version and a 32 bit
+full color. To select the 8 bit version pass "4" (4 bytes per pixel)
+for the bytesperchr parameter; for 32 bit pass "8"
+
+PUB startx(params)
+  Starts the driver. "params" is a pointer to a block of 32 bit parameters longs:
+  params[0]: base pin to use for the VGA
+  params[1]: pointer to screen buffer
+  params[2]: number of columns
+  params[3]: number of rows
+  params[4]: pointer to font data
+  params[5]: font width (for now, must be 8)
+  params[6]: font height
+  params[7]: pixel clock scaling value ($8000_0000 * pixel_clock / system_clock)
+  params[8]: horizontal front porch
+  params[9]: hsync pulse length
+  params[10]: vertical front porch
+  params[11]: vsync lines
+  params[12]: vertical back porch
+  params[13]: polarity: %00 = both positive, %10 = vertical negative, %01 = horizontal negative
+  params[14]: cell size, i.e. bytes per character (1, 2, 4, or 8)
+  
+  returns 1 + the number of the COG used, or 0 on failure
+
+  _cell_size is the size of each character cell in bytes, and
+  may be 8, 4, 2, or 1:
+  if 8, then each character has 2 longs:
+   first long is $RRGGBBcc, where RRGGBB is the text fgcolor, cc is the character
+   second long is $RRGGBBxx, where RRGGBB is the text bgcolor, xx is the effect mask
+
+  if 4, then each character has 4 bytes:
+   first is foreground color (1 byte index into ANSI LUT)
+   second is background color (1 byte index into ANSI LUT)
+   third is character
+   fourth is effect mask
+
+  if 2, then each character has 2 bytes
+   first is character
+   second is: 1 bit effect, 3 bit bg color, 4 bit fg color
+
+  if 1, then we have monochrome 7 bit characters; the high bit is for blinking
+
+}
+
+#include "terminal.common.spin2h"
+
+CON
+
+    INTENSITY               = 80                ' 0..128
+
+    STATE_NORMAL            = 0
+    STATE_ESCAPE            = 1
+    STATE_START_CSI         = 2
+    STATE_IN_CSI            = 3
+    STATE_IN_PRIV           = 4
+    MAX_ESC_ARGS            = 8
+
+    CHAR_HIDDEN             = $01
+    CHAR_UNDERLINE          = $02
+    CHAR_STRIKETHRU         = $04
+    CHAR_BLINK_HIDDEN       = $10
+    CHAR_BLINK_UNDERLINE    = $20
+    CHAR_BLINK_STRIKETHRU   = $40
+    CHAR_BLINK_BG           = $80
+
+    CHAR_INVERSE            = $0100
+    CHAR_BOLD               = $0200
+    DEFAULT_FG_COLOR        = $FFFFFF00
+    DEFAULT_BG_COLOR        = 0
+
+VAR
+
+    long _ptr_dispbuff
+    long _cog
+    long _hw_rev
+    long _cell_size, _cols, _rows
+    long _curx, _cury                           ' cursor position
+    long _savex, _savey
+    long _text_bgcolor, _text_fgcolor           ' current color
+    long _state
+    long _screenptr
+    long _args[MAX_ESC_ARGS]
+    long _argidx
+    long _char_fx
+    long _scroll_first, _scroll_last
+    byte _cursor_visible
+    byte _cursor_enabled
+    byte _cursor_fx
+    byte _saved_cursor_data
+    byte _cursor_mask
+
+OBJ
+
+    smpin   : "core.con.smartpins"
+
+PUB startx(pinbase, ptr_params, ptr_dispbuff): okay | ptr, tmp
+' Start the driver using custom I/O settings
+'   pinbase: first/lowest of 5 I/O pins
+'   ptr_params: pointer to setup parameters
+'   ptr_dispbuff: pointer to display buffer
+    _cols := long[ptr_params][2]
+    _rows := long[ptr_params][3]
+    _cell_size := long[ptr_params][15]
+    _ptr_dispbuff := ptr_dispbuff
+
+' check what kind of hardware we are using
+    if (_hw_rev == 0)
+        _hw_rev := check_hw_rev()
+
+    if (_hw_rev == 1)
+' RevA (old) silicon
+' change streamer commands
+        ptr := @m_bs
+        tmp := $CF000000
+        long[ptr][0] := tmp                     ' before sync
+        long[ptr][1] := tmp                     ' sync
+        long[ptr][2] := tmp                     ' before visible
+        long[ptr][3] := tmp                     ' visible
+        ptr := @m_rf_even
+        long[ptr][0] := $8f000000               ' even chars
+        long[ptr][1] := $8f010000               ' odd chars (diff. LUT base)
+    else
+' new silicon
+        ptr := @m_bs
+        tmp := $7f010000
+        long[ptr][0] := tmp
+        long[ptr][1] := tmp
+        long[ptr][2] := tmp
+        long[ptr][3] := tmp
+        ptr := @m_rf_even
+        long[ptr][0] := $0f000000               ' even characters
+        long[ptr][1] := $0f010000               ' odd characters
+
+    resetTerminal()
+    _cog := cogspin(NEWCOG, @entry, ptr_params) + 1
+    return _cog
+
+PUB stop()
+' Stop the driver
+    if (_cog)
+        cogstop(_cog-1)
+        _cog := 0
+
+PUB tx = putchar
+PUB char = putchar
+PUB putchar(c): result | fg, bg
+' Transmit one character
+    concealcursor()
+    if (_state == STATE_NORMAL)
+        if (c == 8)                             ' backspace
+            position(_curx-1, _cury)
+        elseif (c == 10)                        ' line feed
+            if _cury == _scroll_last
+                scrollup()
+            else
+                _cury++
+        elseif (c == 13)                        ' carriage return
+            _curx := 0
+        elseif (c == 20)                        ' tab
+            position((_curx + 8) & 7, _cury)
+        elseif (c == 27)
+            _state := STATE_ESCAPE
+        else
+            fg := _text_fgcolor
+            bg := _text_bgcolor
+            if _char_fx & CHAR_INVERSE
+                fg, bg := bg, fg                ' swap
+            glyphat(_curx, _cury, c, fg, bg, _char_fx & $FF)
+            _curx++
+            if _curx == _cols
+                _curx := 0
+                if _cury == _scroll_last
+                    scrollup()
+                else
+                    _cury++
+    elseif (_state == STATE_ESCAPE)
+        handle_esc(c)
+    elseif (_state == STATE_START_CSI)
+        handle_csi_start(c)
+    elseif (_state == STATE_IN_CSI)
+        handle_csi(c)
+    elseif (_state == STATE_IN_PRIV)
+        handle_priv(c)
+    revealcursor()
+    return 1
+
+PUB clear()
+' Clear the display
+    clearrange(0, (_cols * _rows)-1)
+
+PUB glyphat = putchar_xy
+PUB putchar_xy(x, y, ch, fgcol, bgcol, fx=0) | bufptr
+' possible effects:
+' $01 = solid mask
+' $02 = underline
+' $04 = strikethrough
+' $08 = reserved
+' $10 = blinking mask
+' $20 = blinking underline
+' $40 = blinking strikethrough
+' $80 = reserved
+' these are stored in the lower 8 bits of the _char_fx variable
+    bufptr := _ptr_dispbuff
+    bufptr += (y * _cols + x) * _cell_size
+    if _cell_size == 8
+        fgcol |= (ch & $FF)
+        bgcol |= (fx & $FF)
+        long[bufptr] := fgcol
+        bufptr += 4
+        long[bufptr] := bgcol
+    elseif _cell_size == 4
+        fgcol := fgcol | (bgcol << 8) | ((ch & $FF) << 16) | ((fx & $FF) << 24)
+        long[bufptr] := fgcol
+    elseif _cell_size == 2
+        fgcol := (ch & $FF) | ((bgcol & $7) << 12) | ((fgcol & $F) << 8)
+        word[bufptr] := fgcol
+    else
+        byte[bufptr] := ch & $ff
+
+PUB hidecursor = hide_cursor
+PUB hide_cursor()
+' Hide the cursor
+    _cursor_enabled := 0
+    setcursorvisible(0)
+
+PUB position = pos_xy
+PUB pos_xy(x, y)
+' Set cursor position
+    _curx := (0 #> x <# _cols-1)
+    _cury := (0 #> y <# _rows-1)
+
+PUB rgbcolor = rgb_color
+PUB rgb_color(r, g, b): rgb
+' calculate a color value from an r,g,b triple
+    if (_cell_size <= 4)
+        rgb := 16 + 36 * (r / 51) + 6 * (g / 51) + (b / 51)
+    else
+        rgb := (r << 24 | g << 16 | b << 8)
+
+PUB showcursor = show_cursor
+PUB show_cursor()
+' globals: force cursor on or off
+    _cursor_enabled := 1
+    setcursorvisible(_cursor_enabled)
+
+PRI ansicolor(n): result | ptr
+' look up an ANSI color from the color table
+    if _char_fx & CHAR_BOLD
+        n |= 8
+    if _cell_size <= 4
+        return n
+    ptr := @colortab
+    return long[ptr + (4 * n)]
+
+PRI check_hw_rev(): tmp
+' check the hardware revision
+' return 1 for original silicon, 2 for new silicon
+' the difference is in how setq+rdlong works for ptra offsets;
+' ptra++ is applied the appropriate number of times in rev 2 silicon
+    tmp := 0
+    cogspin(16, @hwcheck, @tmp)
+    repeat while tmp == 0
+    return tmp
+
+PRI clear_in_display(n) | startpix, endpix
+' clear from cursor to end of display (if n==0) or from start of screen to
+'   cursor (n == 1)
+' n==2 clears whole display and resets cursor to top
+    if n==2
+        _curx := _cury := 0
+        n := 0
+    if n==1
+        startpix := 0
+        endpix := (_cols * _cury) + _curx
+    else
+        startpix := (_cols * _cury) + _curx
+        endpix := (_cols * _rows) - 1
+    clearrange(startpix, endpix)
+
+PRI clear_in_line(n) | startpix, endpix
+
+    if n==2
+        _curx := 0
+        n:=0
+    if n==1
+        startpix := _cols * _cury
+        endpix := (_cols * _cury) + _curx
+    else
+        startpix := (_cols * _cury) + _curx
+        endpix := (_cols * (_cury + 1)) - 1
+    clearrange(startpix, endpix)
+
+PRI clearRange(a, b) | ptr, rngcnt, temp
+' clear from position a to position b (inclusive)
+' a and b are in character offsets (so they have to be scaled appropriately)
+    ptr := _ptr_dispbuff + (_cell_size * a)
+    rngcnt := b-a
+    if (_cell_size == 1)
+        repeat while rngcnt >= 0
+            byte[ptr] := 0
+            ptr += 1
+            --rngcnt
+    elseif (_cell_size == 2)
+        temp := ((_text_fgcolor & $f) | ((_text_bgcolor & $7) << 4)) << 8
+        repeat while rngcnt >= 0
+            word[ptr] := temp
+            ptr += 2
+            --rngcnt
+    elseif (_cell_size == 4)
+        temp := _text_fgcolor | (_text_bgcolor << 8)
+        repeat while rngcnt >= 0
+            long[ptr] := temp
+            ptr += 4
+            --rngcnt
+    else
+        repeat while rngcnt >= 0
+            long[ptr] := _text_fgcolor
+            ptr += 4
+            long[ptr] := _text_bgcolor
+            ptr += 4
+            --rngcnt
+
+PRI concealCursor()
+
+    setcursorvisible(0)
+
+PRI copy_line(dest, src) | linelen
+
+    linelen := _cell_size * _cols
+    dest := _ptr_dispbuff + (dest * linelen)
+    src := _ptr_dispbuff + (src * linelen)
+    bytemove(dest, src, linelen)
+
+PRI defaultval(arg, v): result
+
+  return (arg) ? arg : v
+
+PRI fetchArg(i): result
+' get an argument that's already been set up, return -1 if not valid
+    if i >= _argidx
+        return -1
+    return _args[i]
+
+PRI getArgColor(i): col, newi | r, g, b, code
+' get a color out of arguments
+    code := fetcharg(i++)
+    if code == 0
+        return 0, i
+    if code == 2
+        r := fetcharg(i++) & $FF
+        g := fetcharg(i++) & $FF
+        b := fetcharg(i++) & $FF
+        r := rgbcolor(r, g, b)
+        return r, i
+    if code == 5
+        r := fetcharg(i++) & $FF
+        if _cell_size <= 4
+            return r, i
+        elseif (r <= 15)
+            r := colortab[r]
+        elseif (r >= 232)
+            r := 10 * (r - 232)
+            r += 8
+            return (r << 24 | r << 16 | r << 8), i
+        else
+            r := sixcolor(r)
+            return r, i
+    return 0, i                                 ' punt for now
+
+PRI handle_csi(c)
+' handle ANSI control sequences
+    if (c >= "0" and c <= "9")
+        _args[_argidx] := (10 * _args[_argidx]) + (c - "0")
+        return
+    _argidx++
+    if _argidx == MAX_ESC_ARGS
+        --_argidx
+    if (c == ";")
+        return
+
+    if (c == "A")
+        _cury -= defaultval(_args[0], 1)
+    elseif (c == "B")
+        _cury += defaultval(_args[0], 1)
+    elseif (c == "C")
+        _curx += defaultval(_args[0], 1)
+    elseif (c == "D")
+        _curx -= defaultval(_args[0], 1)
+    elseif (c == "E")
+        _cury += defaultval(_args[0], 1)
+        _curx := 0
+    elseif (c == "F")
+        _cury -= defaultval(_args[0], 1)
+        _curx := 0
+    elseif (c == "G")
+        _curx := defaultval(_args[0], 1) - 1
+    elseif (c == "H")
+        _cury := defaultval(_args[0], 1) - 1
+        _curx := defaultval(_args[1], 1) - 1
+    elseif (c == "J")
+        clear_in_display(defaultval(_args[0], 0))
+    elseif (c == "K")
+        clear_in_line(defaultval(_args[0], 0))
+    elseif (c == "m")
+        setgraphicrendition(0)
+    elseif (c == "r")
+        _scroll_first := defaultval(_args[0], 1) - 1
+        _scroll_last := defaultval(_args[1], _rows) - 1
+        _scroll_first := (0 #> _scroll_first <# _rows-1)
+        _scroll_last := (_scroll_first #> _scroll_last <# _rows-1)
+        _curx := _cury := 0
+    elseif (c == "s")
+        _savex := _curx
+        _savey := _cury
+    elseif (c == "u")
+        _curx := _savex
+        _cury := _savey
+    position(_curx, _cury)                      ' sanity check
+    _state := STATE_NORMAL
+
+PRI handle_csi_start(c)
+' first character of control sequence
+' if it is '?' it's a private control sequence
+    if c == "?"
+        _state := STATE_IN_PRIV
+    else
+        _state := STATE_IN_CSI
+        handle_csi(c)
+
+PRI handle_esc(c) | i
+
+    if (c == "[")
+        repeat i from 0 to MAX_ESC_ARGS-1
+            _args[i] := 0
+        _argidx := 0
+        _state := STATE_START_CSI
+    elseif (c == "D")
+        if _cury == _scroll_last
+            scrollup()
+        else
+            _cury++
+    elseif (c == "M")
+        if _cury == _scroll_first
+            scrolldown()
+        else
+            --_cury
+    elseif (c == "c")
+        resetterminal()
+    else
+        _state := STATE_NORMAL
+
+PRI handle_priv(c) | a
+' handle private escape sequence
+    if (c >= "0" and c <= "9")
+        _args[_argidx] := (10 * _args[_argidx]) + (c - "0")
+        return
+    _argidx++
+    if _argidx == MAX_ESC_ARGS
+        --_argidx
+    if (c == ";")
+        return
+    if (c == "h")
+        a := defaultval(_args[0], 1)
+        if a == 25
+            _cursor_enabled := 1
+    elseif (c == "l")
+        a := defaultval(_args[0], 1)
+        if a == 25
+            _cursor_enabled := 0
+    _state := STATE_NORMAL
+
+PRI reset_graphics_state()
+
+    _text_bgcolor := 0
+    _text_fgcolor := (_cell_size == 8) ? $FFFFFF00 : 7
+    _char_fx := 0
+
+PRI resetTerminal()
+
+    reset_graphics_state()
+    clear()
+    _cursor_visible := 0
+    _cursor_enabled := 1
+    if _cell_size >= 4
+        _cursor_fx := $10                       ' blinking mask
+        _cursor_mask := $7f                     ' bg color blink disabled
+    else                                        '   for cursor
+        _cursor_fx := $80                       ' for 2 byte and 1 byte,
+        _cursor_mask := $ff                     '   only effect is in high bit
+    _curx := _cury := 0
+    _state := STATE_NORMAL
+    _scroll_first := 0
+    _scroll_last:= _rows-1
+
+PRI revealCursor()
+
+    setcursorvisible(_cursor_enabled)
+
+PRI scrollDown() | first, i
+
+    i := _scroll_last
+    first := _scroll_first
+    repeat while i > first
+        copy_line(i, i-1)
+        i := i-1
+    clearrange(_cols * first, (_cols * (first + 1))-1)
+
+PRI scrollUp() | last, i
+
+    i := _scroll_first
+    last := _scroll_last
+    repeat while i < last
+        copy_line(i, i+1)
+        i := i+1
+    clearrange(_cols * last, (_cols * (last + 1)) - 1)
+
+PRI setCursorVisible(yesno): result | bufptr, x, y
+
+    if _cursor_visible == yesno
+        return yesno
+
+' if asking to turn on the cursor, but it is
+' disabled, ignore the request
+    if yesno and not _cursor_enabled
+        return 0
+
+' change cursor state
+    _cursor_visible := yesno
+
+    bufptr := _ptr_dispbuff
+' restrict x to be between 0 and _cols-1
+    x := _curx
+    y := _cury
+    x := 0 #> x <# (_cols-1)
+    y := 0 #> y <# (_rows-1)
+
+    bufptr += ((y * _cols) + x) * _cell_size
+    if _cell_size == 8
+        bufptr += 4
+    elseif _cell_size == 4
+        bufptr += 3
+    else
+        bufptr += (_cell_size-1)
+    x := byte[bufptr]
+    if _cursor_visible
+        _saved_cursor_data := x
+        x |= _cursor_fx
+        x &= _cursor_mask                       ' turn off bg color blink
+    else
+        x := _saved_cursor_data
+    byte[bufptr] := x
+
+' return old cursor state
+    return (yesno) ? 0 : 1
+
+PRI setGraphicRendition(i) | code
+
+    if i > _argidx
+        return
+    code := fetcharg(i++)
+
+    case code
+        0:
+            reset_graphics_state()
+        1:
+            _char_fx |= CHAR_BOLD
+        4:
+            _char_fx |= CHAR_UNDERLINE
+        5:
+            _char_fx |= CHAR_BLINK_HIDDEN|CHAR_BLINK_BG
+        7:
+            _char_fx |= CHAR_INVERSE
+        8:
+            _char_fx |= CHAR_HIDDEN
+        9:
+            _char_fx |= CHAR_STRIKETHRU
+        21:
+            _char_fx &= !CHAR_BOLD
+        22:
+            _char_fx &= !CHAR_BOLD
+        24:
+            _char_fx &= !CHAR_UNDERLINE
+        27:
+            _char_fx &= !CHAR_INVERSE
+        28:
+            _char_fx &= !CHAR_HIDDEN
+        29:
+            _char_fx &= !CHAR_STRIKETHRU
+        30..37:
+            _text_fgcolor := ansicolor(code - 30)
+        38:
+            _text_fgcolor,i := getargcolor(i)
+        39:
+            _text_fgcolor := DEFAULT_FG_COLOR
+        40..47:
+            _text_bgcolor := ansicolor(code - 40)
+        48:
+            _text_bgcolor,i := getargcolor(i)
+        49:
+            _text_bgcolor := DEFAULT_BG_COLOR
+    setgraphicrendition(i)
+
+PRI sixColor(x): result | r, g, b
+' calculate an RGB color from a 6,6,6 encoded 8 bit color
+    b := x // 6
+    x := x / 6
+    g := x // 6
+    r := x / 6
+    r := (255 * r)/6
+    g := (255 * g)/6
+    b := (255 * b)/6
+    return (r << 24) | (g << 16) | b
+
+DAT
+
+    colortab
+        long $00000000, $7F000000, $007F0000, $7F7F0000
+        long $00007F00, $7F007F00, $007F7F00, $C0C0C000
+        long $7F7F7F00, $FF000000, $00FF0000, $FFFF0000
+        long $0000FF00, $FF00FF00, $00FFFF00, $FFFFFF00
+  
+CON
+
+    PIXSHIFT            = 31
+    LINE_HANDLER        = $1c0                  ' COG mem addr of
+    LINE_HANDLER_END    = $1f0                  ' pixel subroutine
+  
+DAT     
+'l      c       i       o                       c/f
+                org     0
+' on entry to the COG, ptra contains the parameter block, and
+' ptrb points to the HUB address of the code (@entry)
+entry
+' read parameters
+basepin_val
+                rdlong  basepin_val, ptra++
+buffer_base
+                rdlong  buffer_base, ptra++
+text_cols
+                rdlong  text_cols, ptra++
+text_rows
+                rdlong  text_rows, ptra++
+font_base
+                rdlong  font_base, ptra++
+fnt_width
+                rdlong  fnt_width, ptra++
+fnt_height
+                rdlong  fnt_height, ptra++
+fpix_scale
+                rdlong  fpix_scale, ptra++
+hfront_porch
+                rdlong  hfront_porch, ptra++
+hsync_pulse
+                rdlong  hsync_pulse, ptra++
+hback_porch
+                rdlong  hback_porch, ptra++
+vfront_porch
+                rdlong  vfront_porch, ptra++
+vsync_pulse
+                rdlong  vsync_pulse, ptra++
+vback_porch
+                rdlong  vback_porch, ptra++
+polarity
+                rdlong  polarity, ptra++
+' this must be either 8 (for 32 bit color) or 4 (for 8 bit color)
+bytesperchr
+                rdlong  bytesperchr, ptra++
+
+' Setup 
+' (this code can be overwritten once we are going)
+
+vga_start
+' calculate things based on parameters
+char_cnt
+                mov     char_cnt, text_cols
+strkthru_ln
+                shr     char_cnt, #1            ' process 2 chars at a time
+vsync_val
+                mov     strkthru_ln, fnt_height
+stride
+                shr     strkthru_ln, #1         ' divide height by 2
+stride_chunks
+                mov     stride, text_cols
+hpixels
+                mul     stride, bytesperchr
+vpixels
+                mov     stride_chunks, stride
+ptr_buff
+                add     stride_chunks, #63
+ptr_fnt
+                shr     stride_chunks, #6       ' divide by 64
+mycogid
+                mov     hpixels, text_cols
+fntln_cntr
+                mul     hpixels, fnt_width
+x
+                mov     vpixels, text_rows
+y
+                mul     vpixels, fnt_height
+
+'l      c       i       o                       c/f
+' copy parameters into settings
+curchar
+                add     m_rf_even, fnt_width
+cureff
+                add     m_rf_odd, fnt_width
+bgcolor
+                add     m_bs, hfront_porch
+fgcolor
+                add     m_sn, hsync_pulse
+                add     m_bv, hback_porch
+                add     m_vi, hpixels
+
+' put our COG id into the DAC info
+                cogid   mycogid
+                shl     mycogid, #8
+                or      dacmode_s, mycogid
+                or      dacmode_c, mycogid
+
+                setxfrq fpix_scale              ' set transfer frequency
+                mov     vsync_val, basepin_val
+                add     vsync_val, #4
+	
+        ' set up initial polarity
+                test    polarity, #%10          wc
+                drvc    vsync_val
+                test    polarity, #1            wc
+' NOTE: the setcmod instruction puts its argument in the D field (bits 9-17)
+' so to set the low bit of the argument, set bit 9 of the instruction
+                bitc    cmodval, #9             ' set bit for cmodval
+	
+' set up level scaling
+                setcy   ##INTENSITY << 24       ' r  set colorspace for rgb
+                setci   ##INTENSITY << 16       ' g
+                setcq   ##INTENSITY << 08       ' b
+cmodval
+                setcmod #%01_0_000_0            ' enable colorspace conversion
+                                                ' note low bit is set above
+
+                wrpin   dacmode_s, basepin_val  ' enable dac modes in pins 0..3
+                dirh    basepin_val
+                add     basepin_val, #1
+                wrpin   dacmode_c, basepin_val
+                dirh    basepin_val
+                add     basepin_val, #1
+                wrpin   dacmode_c, basepin_val
+                dirh    basepin_val
+                add     basepin_val, #1
+                wrpin   dacmode_c, basepin_val
+                dirh    basepin_val
+
+' load different routines into upper LUT depending on the bytes per char
+' 8, 4, 2, or 1
+' ptrb still points at @entry; make it point to the code we want to load
+                encod   bytesperchr, bytesperchr' 1, 2, 4, 8 -> 0, 1, 2, 3
+                alts    bytesperchr, #ln_offs_tbl   ' look up in ln_offs_tbl
+                add     ptrb, 0-0               ' offset for the code to load
+
+' now load the code into LUT
+                setq    #(LINE_HANDLER_END-LINE_HANDLER)-1
+                rdlong  LINE_HANDLER, ptrb
+'l      c       i       o                       c/f
+' Field loop
+hfield
+                mov     y, vfront_porch         ' top blanks
+                call    #blank
+                mov     ptr_buff, buffer_base
+                mov     ptr_fnt, font_base
+                mov     fntln_cntr, fnt_height
+                add     field_cnt, #1
+                test    field_cnt, #32          wz
+        if_z    mov     field_fx, #$ff
+        if_nz   mov     field_fx, #$0f
+  
+                mov     y, vpixels              ' set visible line
+line    
+                call    #hsync                  ' do horizontal sync;
+                                                ' also loads up next font line
+
+' now read the character data
+' this is stored as 8 byte per character;
+' two longs, first containing 24 bit color + character glyph,
+' second containing the 24 bit color and a reserved field
+                rdfast  stride_chunks, ptr_buff
+
+                sub     fntln_cntr, #1          wz
+        if_z    mov     fntln_cntr, fnt_height
+        if_z    mov     ptr_fnt, font_base
+        if_z    add     ptr_buff, stride        ' next line
+
+' check for effects on this line
+                mov     line_fx, #$91
+                cmp     fntln_cntr, #1          wz
+        if_z    or      line_fx, #$22
+                cmp     fntln_cntr, strkthru_ln wz
+        if_z    or      line_fx, #$44
+
+' turn off blink specific stuff
+                and     line_fx, field_fx
+
+' the main loop processes 2 characters (16 pixels) at a time,
+' ping-ponging between even and odd
+'
+' we use LUT elements 0,1 and 32,33 to hold the colors, ping-ponging back
+' between them
+' we have to use 32,33 because the granularity of changing the streamer
+' LUT pointer is 5 bits
+                call    #\LINE_HANDLER          ' call the pixel loop
+                djnz    y, #line
+
+end_of_line
+                mov     y, vback_porch          ' bottom blanks
+                call    #blank
+
+                drvnot  vsync_val               ' sync on
+
+                mov     y, vsync_pulse          ' sync blanks
+                call    #blank
+
+                drvnot  vsync_val               ' sync off
+
+                jmp     #hfield                 ' loop
+
+	
+' Subroutines
+blank           call    #hsync                  ' blank lines
+                xcont   m_vi, #0
+    _ret_       djnz    y, #blank
+
+hsync           xcont   m_bs, #0                ' horizontal sync
+                xcont   m_sn, #1
+                xcont   m_bv, #0
+                setq    #63                     ' read 64 longs from font table
+                rdlong  fnt_ln, ptr_fnt
+    _ret_       add     ptr_fnt, #256
+
+' Initialized data
+dacmode_s       long    smpin.DAC_123OHM_3V3 | smpin.OUTPUT_ENABLED
+dacmode_c       long    smpin.DAC_75OHM_2V0 | smpin.OUTPUT_ENABLED
+
+m_bs            long    $7F010000{+HFRONT_PORCH}' before sync
+m_sn            long    $7F010000{+HSYNC}       ' sync
+m_bv            long    $7F010000{+HBACK_PORCH} ' before visible
+m_vi            long    $7F010000{+HPIXELS}     ' visible
+
+m_rf_even       long    $0F000000{+FONT_WIDTH}  ' 1bpp
+m_rf_odd        long    $0F010000{+FONT_WIDTH}  ' 1bpp LUT immediate
+
+' active character effects for this line
+' these bits have the following meanings:
+'    01 = hide (show all fgground color)
+'    02 = underline
+'    04 = strikethrough
+'    08 = reserved
+'    10 = blinking hide
+'    20 = blinking underline
+'    40 = blinking strikethrough
+'    80 = if hidden, use bgcolor instead of fgcolor
+
+line_fx         long    0
+
+' active effects for this field; the blinking ones will be turned off
+' on half of the fields
+field_fx        long    0
+
+' count of elapsed fields, used for blinking
+field_cnt       long    0
+
+' standard ANSI 256 color palette
+color_plt
+	long	$00000000, $80000000, $00800000, $80800000, $00008000, $80008000, $00808000, $c0c0c000
+	long	$80808000, $ff000000, $00ff0000, $ffff0000, $0000ff00, $ff00ff00, $00ffff00, $ffffff00
+	long	$00000000, $00003300, $00006600, $00009900, $0000cc00, $0000ff00, $00330000, $00333300
+	long	$00336600, $00339900, $0033cc00, $0033ff00, $00660000, $00663300, $00666600, $00669900
+	long	$0066cc00, $0066ff00, $00990000, $00993300, $00996600, $00999900, $0099cc00, $0099ff00
+	long	$00cc0000, $00cc3300, $00cc6600, $00cc9900, $00cccc00, $00ccff00, $00ff0000, $00ff3300
+	long	$00ff6600, $00ff9900, $00ffcc00, $00ffff00, $33000000, $33003300, $33006600, $33009900
+	long	$3300cc00, $3300ff00, $33330000, $33333300, $33336600, $33339900, $3333cc00, $3333ff00
+	long	$33660000, $33663300, $33666600, $33669900, $3366cc00, $3366ff00, $33990000, $33993300
+	long	$33996600, $33999900, $3399cc00, $3399ff00, $33cc0000, $33cc3300, $33cc6600, $33cc9900
+	long	$33cccc00, $33ccff00, $33ff0000, $33ff3300, $33ff6600, $33ff9900, $33ffcc00, $33ffff00
+	long	$66000000, $66003300, $66006600, $66009900, $6600cc00, $6600ff00, $66330000, $66333300
+	long	$66336600, $66339900, $6633cc00, $6633ff00, $66660000, $66663300, $66666600, $66669900
+	long	$6666cc00, $6666ff00, $66990000, $66993300, $66996600, $66999900, $6699cc00, $6699ff00
+	long	$66cc0000, $66cc3300, $66cc6600, $66cc9900, $66cccc00, $66ccff00, $66ff0000, $66ff3300
+	long	$66ff6600, $66ff9900, $66ffcc00, $66ffff00, $99000000, $99003300, $99006600, $99009900
+	long	$9900cc00, $9900ff00, $99330000, $99333300, $99336600, $99339900, $9933cc00, $9933ff00
+	long	$99660000, $99663300, $99666600, $99669900, $9966cc00, $9966ff00, $99990000, $99993300
+	long	$99996600, $99999900, $9999cc00, $9999ff00, $99cc0000, $99cc3300, $99cc6600, $99cc9900
+	long	$99cccc00, $99ccff00, $99ff0000, $99ff3300, $99ff6600, $99ff9900, $99ffcc00, $99ffff00
+	long	$cc000000, $cc003300, $cc006600, $cc009900, $cc00cc00, $cc00ff00, $cc330000, $cc333300
+	long	$cc336600, $cc339900, $cc33cc00, $cc33ff00, $cc660000, $cc663300, $cc666600, $cc669900
+	long	$cc66cc00, $cc66ff00, $cc990000, $cc993300, $cc996600, $cc999900, $cc99cc00, $cc99ff00
+	long	$cccc0000, $cccc3300, $cccc6600, $cccc9900, $cccccc00, $ccccff00, $ccff0000, $ccff3300
+	long	$ccff6600, $ccff9900, $ccffcc00, $ccffff00, $ff000000, $ff003300, $ff006600, $ff009900
+	long	$ff00cc00, $ff00ff00, $ff330000, $ff333300, $ff336600, $ff339900, $ff33cc00, $ff33ff00
+	long	$ff660000, $ff663300, $ff666600, $ff669900, $ff66cc00, $ff66ff00, $ff990000, $ff993300
+	long	$ff996600, $ff999900, $ff99cc00, $ff99ff00, $ffcc0000, $ffcc3300, $ffcc6600, $ffcc9900
+	long	$ffcccc00, $ffccff00, $ffff0000, $ffff3300, $ffff6600, $ffff9900, $ffffcc00, $ffffff00
+	long	$08080800, $12121200, $1c1c1c00, $26262600, $30303000, $3a3a3a00, $44444400, $4e4e4e00
+	long	$58585800, $62626200, $6c6c6c00, $76767600, $80808000, $8a8a8a00, $94949400, $9e9e9e00
+	long	$a8a8a800, $b2b2b200, $bcbcbc00, $c6c6c600, $d0d0d000, $dadada00, $e4e4e400, $eeeeee00
+
+' space for 256 bytes of font data
+fnt_ln          long    0[64]
+
+' table of offsets to the character handling subroutines
+ln_offs_tbl
+                long    @char1_loop - @entry
+                long    @char2_loop - @entry
+                long    @char4_loop - @entry
+                long    @char8_loop - @entry
+
+                orgf    LINE_HANDLER
+
+                fit     LINE_HANDLER_END
+	
+' LUT subroutines
+' all of these should process a whole line of
+' output
+'
+' timing: generally speaking we process an even
+' and odd character (16 pixels) at a time
+' assuming a 250 MHz system clock this gives us
+' the following requirements:
+
+' 640x480 25 MHz pixel clock: 10 cycles/pixel
+'              so 5*16 == 80 instructions
+' 800x600 40 MHz pixel clock:  6 cycles/pixel
+'              so 3*16 == 48 instructions
+' 1024x768 65 MHz pixel clock: 3.75 cycles/pixel
+'              or roughly 30 instructions
+'
+' for a 160 MHz system clock:
+' 640x480:  50 instructions
+' 800x600:  32 instructions
+' 1024x768: 19 instructions
+
+' 8 bytes/character
+' 24 instructions
+                org     LINE_HANDLER
+char8_loop
+                rep     @end_32bppchar, char_cnt
+next_32bppchar
+' even pixel
+                rflong  fgcolor
+                rflong  bgcolor
+                getbyte curchar, fgcolor, #0
+                test    bgcolor, line_fx        wz
+
+                andn    fgcolor, #$FF
+                andn    bgcolor, #$FF
+                altgb   curchar, #fnt_ln        ' fetch from font table
+                getbyte curchar
+
+        if_nz   or      curchar, #$ff           ' if effect mask active add line
+                xcont   m_rf_even, curchar
+                wrlut   bgcolor, #0
+                wrlut   fgcolor, #1
+
+' odd pixel
+                rflong  fgcolor
+                rflong  bgcolor
+                getbyte curchar, fgcolor, #0
+                test    bgcolor, line_fx        wz
+
+                andn    fgcolor, #$FF
+                andn    bgcolor, #$FF           ' handle in the glyphat code
+                altgb   curchar, #fnt_ln        ' fetch from font table
+                getbyte curchar
+
+        if_nz   or      curchar, #$ff           ' if effect mask active add line
+                xcont   m_rf_odd, curchar
+                wrlut   bgcolor, #32
+                wrlut   fgcolor, #33
+
+' end of loop
+end_32bppchar
+                ret
+
+                fit     LINE_HANDLER_END
+
+' 4 bytes/char
+' 30 instructions
+	
+                org     LINE_HANDLER
+char4_loop
+                rep     @end_8bppchar, char_cnt
+next_8bppchar
+	' even character
+                rfbyte  fgcolor
+                rfbyte  bgcolor
+                rfbyte  curchar
+                rfbyte  cureff                  wc
+
+' do table lookup on colors
+                alts    fgcolor, #color_plt
+                mov     fgcolor, 0-0
+                alts    bgcolor, #color_plt
+                mov     bgcolor, 0-0
+
+                altgb   curchar, #fnt_ln        ' fetch from font table
+                getbyte curchar
+                and     cureff, line_fx         wz
+
+        if_nz   muxnc   curchar, #$ff           ' if effect mask active add line
+                xcont   m_rf_even, curchar
+                wrlut   bgcolor, #0
+                wrlut   fgcolor, #1
+
+' odd character
+                rfbyte  fgcolor
+                rfbyte  bgcolor
+                rfbyte  curchar
+                rfbyte  cureff                  wc
+
+' do table lookup on colors
+                alts    fgcolor, #color_plt
+                mov     fgcolor, 0-0
+                alts    bgcolor, #color_plt
+                mov     bgcolor, 0-0
+
+                altgb   curchar, #fnt_ln        ' fetch from font table
+                getbyte curchar
+                and     cureff, line_fx         wz
+
+        if_nz   muxnc   curchar, #$ff           ' if effect mask active add line
+                xcont   m_rf_odd, curchar
+                wrlut   bgcolor, #32
+                wrlut   fgcolor, #33
+end_8bppchar
+                ret
+                fit     LINE_HANDLER_END
+
+' 2 bytes/char
+' this consists of an 8 bit character followed by
+' 8 bit effects; 1 bit blink, 3 bits bg color, 4 bits fg color
+'
+' 30 instructions
+                org     LINE_HANDLER
+char2_loop
+                and     line_fx, #$80
+                rep     @end_char16, char_cnt
+next_char16
+
+' even character
+                rfbyte  curchar
+                rfbyte  cureff                  wc
+                getnib  fgcolor, cureff, #0
+                getnib  bgcolor, cureff, #1
+
+' do table lookup on colors
+                alts    fgcolor, #color_plt
+                mov     fgcolor, 0-0
+                alts    bgcolor, #color_plt
+                mov     bgcolor, 0-0
+
+                altgb   curchar, #fnt_ln        ' fetch from font table
+                getbyte curchar
+                test    cureff, line_fx         wz
+        if_nz   xor     curchar, #$ff           ' if effect mask active add line
+
+                xcont   m_rf_even, curchar
+                wrlut   bgcolor, #0
+                wrlut   fgcolor, #1
+
+' odd character
+                rfbyte  curchar
+                rfbyte  cureff                  wc
+                getnib  fgcolor, cureff, #0
+                getnib  bgcolor, cureff, #1
+
+' do table lookup on colors
+                alts    fgcolor, #color_plt
+                mov     fgcolor, 0-0
+                alts    bgcolor, #color_plt
+                mov     bgcolor, 0-0
+
+                altgb   curchar, #fnt_ln        ' fetch from font table
+                getbyte curchar
+                test    cureff, line_fx         wz
+        if_nz   xor     curchar, #$ff           ' if effect mask active add line
+
+                xcont   m_rf_odd, curchar
+                wrlut   bgcolor, #32
+                wrlut   fgcolor, #33
+end_char16
+                ret
+                fit     LINE_HANDLER_END
+
+' 1 bytes/char
+' this consists of an 7 bit character; the high bit is
+' used for blinking
+'
+' 16 instructions
+                org     LINE_HANDLER
+char1_loop
+                mov     fgcolor, color_plt+7
+                mov     bgcolor, color_plt
+                wrlut   bgcolor, #0
+                wrlut   fgcolor, #1
+                wrlut   bgcolor, #32
+                wrlut   fgcolor, #33
+                and     line_fx, #$80
+
+                rep     @end_char8, char_cnt
+next_char8
+
+' even character
+                rfbyte  curchar
+                mov     cureff, curchar
+                and     curchar, #$7f
+                and     cureff, line_fx         wz
+
+                altgb   curchar, #fnt_ln        ' fetch from font table
+                getbyte curchar
+
+        if_nz   xor     curchar, #$ff           ' if effect mask active add line
+                xcont   m_rf_even, curchar
+
+' odd character
+                rfbyte  curchar
+                mov     cureff, curchar
+                and     curchar, #$7f
+                and     cureff, line_fx         wz
+
+                altgb   curchar, #fnt_ln        ' fetch from font table
+                getbyte curchar
+
+        if_nz   xor     curchar, #$ff           ' if effect mask active add line
+                xcont   m_rf_odd, curchar
+
+' end of loop
+end_char8
+                ret
+                fit     LINE_HANDLER_END
+
+DAT
+
+'l      c       i       o                       c/f
+	            org     0
+' code used to check hardware revision
+' in rev A (the original silicon) setq + rdlong pa, ptrb++ 
+'  increments ptrb only once
+' in rev B (revised silicon) it will increment ptrb appropriately
+'
+hwcheck
+                mov     pb, ptrb
+                setq    #1
+                rdlong  $1e0, ptrb++
+                subr    pb, ptrb
+                shr     pb, #2                  wz
+        if_z    mov     pb, #1
+                wrlong  pb, ptra
+                cogid   pa
+                cogstop pa
+

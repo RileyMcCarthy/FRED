@@ -1,0 +1,110 @@
+{
+    --------------------------------------------
+    Filename: signal.adc.mcp320x.spin2
+    Author: Jesse Burt
+    Description: Driver for Microchip MCP320x Analog to Digital Converters (P2 version)
+    Copyright (c) 2022
+    Started Nov 26, 2019
+    Updated Nov 22, 2022
+    See end of file for terms of use.
+    --------------------------------------------
+}
+#include "signal.adc.common.spin2h"
+
+VAR
+
+    long _CS
+    long _adc_ref
+    byte _ch
+
+OBJ
+
+    spi : "com.spi.10mhz"
+    core: "core.con.mcp320x"
+
+PUB null()
+' This is not a top-level object
+
+PUB startx(CS_PIN, SCK_PIN, MOSI_PIN, MISO_PIN, SCK_FREQ=1_000_000): status
+' Start the driver, using custom I/O settings
+    if lookdown(CS_PIN: 0..63) and lookdown(SCK_PIN: 0..63) and {
+}   lookdown(MOSI_PIN: 0..63) and lookdown(MISO_PIN: 0..63)
+        if (status := spi.init(SCK_PIN, MOSI_PIN, MISO_PIN, core.SPI_MODE, SCK_FREQ))
+            waitms(1)
+            _CS := CS_PIN
+            pinh(_CS)
+            return status
+    ' if this point is reached, something above failed
+    ' Double check I/O pin assignments, connections, power
+    ' Lastly - make sure you have at least one free core/cog
+    return FALSE
+
+PUB stop()
+' Stop the driver
+    spi.deinit()
+    _CS := 0
+    _adc_ref := 0
+    _ch := 0
+
+PUB defaults()
+' Factory defaults
+    set_adc_channel(0)
+    set_ref_voltage(3_300000)
+
+PUB adc_channel(): ch
+' Get currently set ADC channel (cached)
+    return _ch
+
+PUB adc_data(): adc_word | cfg
+' ADC data word
+'   Returns: 12-bit ADC word
+    case _ch
+        0, 1:
+            cfg := core.SINGLE_ENDED | core.MSBFIRST | (_ch << core.ODD_SIGN)
+        other:
+            return
+
+    pinl(_CS)
+    spi.wrbits_msbf((core.START_MEAS | cfg), 4)
+    adc_word := (spi.rdbits_msbf(13) & $fff)    ' 1 null bit + 12 data bits
+    pinh(_CS)
+
+PUB adc2volts(adc_word): volts
+' Scale ADC word to microvolts
+    return muldiv64(_adc_ref, adc_word, 4096)
+
+PUB ref_voltage(): v
+' Get currently set reference voltage
+'   Returns: microvolts
+    return _adc_ref
+
+PUB set_adc_channel(ch)
+' Set ADC channel for subsequent reads
+'   Valid values: 0, 1
+    _ch := 0 #> ch <# 1
+
+PUB set_ref_voltage(v): curr_v
+' Set ADC reference/supply voltage (Vdd), in microvolts
+'   Valid values: 2_700_000..5_500_000 (2.7 .. 5.5V)
+    _adc_ref := (2_700000 #> v <# 5_500000)
+
+DAT
+{
+Copyright 2022 Jesse Burt
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
+OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+}
+

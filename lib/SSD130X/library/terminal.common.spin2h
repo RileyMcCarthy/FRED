@@ -1,0 +1,156 @@
+{
+    --------------------------------------------
+    Filename: terminal.common.spin2h
+    Author: Jesse Burt
+    Description: Library to extend a terminal driver with
+        standard terminal routines (P2 version)
+    Copyright (c) 2022
+    Started Dec 14, 2019
+    Updated Dec 26, 2022
+    See end of file for terms of use.
+    --------------------------------------------
+    NOTE: This is based on std_text_routines.spinh,
+        originally by Eric Smith.
+
+    Must be included using the preprocessor #include directive
+
+    Requires:
+        An object with a putchar(param) method
+    Optionally:
+        newline() (Note: _HAS_NEWLINE_ must be #defined in the including file)
+}
+
+{ if a maximum buffer size isn't defined at build-time, go with the default of 100 bytes.
+    increase if program behavior is odd (e.g., visible string corruption) }
+#ifndef TMPBUFF_SZ
+#define TMPBUFF_SZ 100
+#endif
+
+#ifndef TERMCODES_H
+#include "termcodes.spin2h"
+#endif
+
+OBJ
+
+    stl : "string"
+
+VAR
+
+    byte _tmp[TMPBUFF_SZ]
+
+PUB bin = putbin
+PUB putbin(val, digits)
+' Output a binary number (zero-padded)
+    stl.itoab(val, @_tmp, stl.IBIN)
+    puts(@_tmp)
+
+PUB dec = putdec
+PUB putdec(val)
+' Output a signed decimal number
+    stl.itoa(val, @_tmp)
+    puts(@_tmp)
+
+PUB decuns = putudec
+PUB udec = putudec
+PUB putudec(val, digits)
+' Output an unsigned decimal number (zero-padded)
+'   val: value to print
+'   digits: number of digits to display
+    stl.atoib(val, stl.IDEC)
+    puts(@_tmp)
+
+PUB hex = puthex
+PUB puthex(val, digits)
+' Output a hexadecimal number (zero-padded)
+'   val: value to print
+'   digits: number of digits to display
+    stl.itoab(val, @_tmp, stl.IHEX)
+    puts(@_tmp)
+
+PUB hexs = puthexs
+PUB puthexs(val, digits)
+' Output a hexadecimal number (zero-padded; small implementation)
+'   val: value to print
+'   digits: number of digits to display
+    puts(stl.hexs(val, digits))
+
+#ifndef _HAS_NEWLINE_
+PUB newline()
+' Output a carriage return and line-feed
+    putchar(CR)
+    putchar(LF)
+#endif
+
+PUB printf(fmt=@"", arg1=0, arg2=0, arg3=0, arg4=0, arg5=0, arg6=0, arg7=0, arg8=0, arg9=0, arg10=0)
+' Output a C-like formatted print
+'   fmt: formatting specification
+'   ptr_args: pointer to arguments used to fill in formatting variables
+'
+'   Recognized formatting specification:
+'   Escape codes:
+'       \\: backslash
+'       \t: tab
+'       \n: line-feed (next line, same column)
+'       \r: carriage-return (first column of current line)
+'           (combine \n\r for start of next line)
+'       \###: 3-digit/1-byte octal code for non-printable chars (e.g., \033 for ESC)
+'
+'   Formatting specifiers:
+'       %%: percent-sign
+'       %c: character
+'       %d, %i: decimal (signed)
+'       %b: binary
+'       %o: octal
+'       %u: decimal (unsigned)
+'       %x, %X: hexadecimal (lower-case, upper-case)
+'       %f: IEEE-754 float (not yet implemented)
+'       %s: string
+'
+'   Optionally precede formatting spec letter with the following:
+'       0: pad numbers with zeroes (e.g., %0d for zero-padded decimal)
+'           (default padding character is space, when padding is necessary)
+'       #.#: minimum field width.maximum field width (e.g. %2.5d for decimal with 2..5 digits)
+'       -: left-justify (e.g. %-4.8x for left-justified hex with 4..8 digits)
+    bytefill(@_tmp, 0, TMPBUFF_SZ)
+    stl.sprintf(@_tmp, fmt, @arg1)
+    puts(@_tmp)
+
+PUB str = puts
+PUB puts(s) | c
+' Output a string
+'   NOTE: a newline is _not_ appended to the string automatically (use strln() instead)
+    repeat while ((c := byte[s++]) <> NUL)
+        putchar(c)
+
+PUB strln(s)
+' Output a string, with a newline appended
+    puts(s)
+    newline{}
+
+PUB wr_bytex(b, bcnt)
+' Repeatedly output byte
+'   b: byte to output
+'   bcnt: number of times to output 'b'
+    repeat bcnt
+        putchar(b)
+
+DAT
+{
+Copyright 2022 Jesse Burt
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
+OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+}
+

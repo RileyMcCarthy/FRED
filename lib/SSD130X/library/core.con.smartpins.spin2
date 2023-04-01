@@ -1,0 +1,184 @@
+CON
+' Low-level/smart-pin configuration
+'   Write using the WRPIN instruction (D field)
+{
+
+        28   24  21      14 11 8  6     1       <- LSB of field
+        |    |   |       |  |  |  |     |
+        |    |   |     CIOHHHLLL  |     |
+        |    |   |      DDDDDDDD  |     |       <- DAC mode
+    %AAAA_BBBB_FFF_PPPPPPPPPPPPP_TT_MMMMM_0     <- D[31..0]
+
+    Field               Symbol below
+    M[0..5]:            MODE
+    T[0..1]:            DIR_OUT_CTRL
+    P[0..12]:           P
+    L[0..2]:            LLL
+    H[0..2]:            HHH
+    O[0]:               O
+    I[0]:               I
+    D[0..7]:            DACLEVEL    (applies to DAC mode only)
+    C[0]:               C
+    F[0..2]:            FILTER
+    B[0..3]:            BINP
+    A[0..3]:            AINP
+}
+' Smartpin modes:
+    MODE                        = 1
+    DEFAULT                     = %00000 << MODE
+    SMARTPIN_OFF                = %00000 << MODE
+    DAC_NOISE                   = %00001 << MODE
+    DAC16B_DITH_NOISE           = %00010 << MODE
+    DAC16B_DITH_PWM             = %00011 << MODE
+    PULSE_CYCLE_OUT             = %00100 << MODE
+    TRANSITION_OUT              = %00101 << MODE
+
+' Numerically-controlled Oscillator
+'   X[31..16] - Phase
+'   X[15..0] - Base period (cycles)
+'   Y[31..0] - Added to Z[31..0] each period
+    NCO_FREQ                    = %00110 << MODE
+    NCO_DUTY                    = %00111 << MODE
+
+
+' Pulse-Width Modulation
+'   Triangle, Sawtooth, Switch-Mode Power Supply
+    PWM_TRI                     = %01000 << MODE
+    PWM_SAW                     = %01001 << MODE
+    PWM_SMPS                    = %01010 << MODE
+
+    AB_QUADRATURE               = %01011 << MODE
+    INC_A1_B1                   = %01100 << MODE
+    INC_A1_B1_DEC_A1_B0         = %01101 << MODE
+    INC_A_HIGH_DEC_B_HIGH       = %01110 << MODE
+    INC_A_RISE_DEC_B_RISE       = %01111 << MODE
+    TIME_A_STATES               = %10000 << MODE
+    TIME_A_HIGH_STATES          = %10001 << MODE
+    TIME_X_A_HIGHS              = %10010 << MODE
+    X_PERIODS_CT_TIME           = %10011 << MODE
+    X_PERIODS_CT_STATES         = %10100 << MODE
+    PERIOD_XPLUSCLKS_CT_TIME    = %10101 << MODE
+    PERIOD_XPLUSCLKS_CT_STATES  = %10110 << MODE
+    PERIOD_XPLUSCLKS_CT_PERIOD  = %10111 << MODE
+' ADC sample/filter/capture, internally clocked
+    ADC_SAMP_INTCLK             = %11000 << MODE
+    ADC_SAMP_EXTCLK             = %11001 << MODE
+    ADC_SCOPE                   = %11010 << MODE
+' USB Host/Device
+    USBHOST_DEV                 = %11011 << MODE
+' Synchronous serial
+    SYNCSERIAL_TX               = %11100 << MODE
+    SYNCSERIAL_RX               = %11101 << MODE
+' Asynchronous serial
+    ASYNCSERIAL_TX              = %11110 << MODE
+    ASYNCSERIAL_RX              = %11111 << MODE
+
+    DIR_OUT_CTRL                = 6
+    OUTPUT_DISABLED             = %00 << DIR_OUT_CTRL
+    OUTPUT_ENABLED              = %01 << DIR_OUT_CTRL
+    DAC_OUT_ENABLES_ADC         = %00 << DIR_OUT_CTRL
+    DAC_OTHER_ENABLES_ADC       = %10 << DIR_OUT_CTRL
+    SMART_OUT_DRIVE             = %00 << DIR_OUT_CTRL
+    SMART_OTHER_DRIVE           = %10 << DIR_OUT_CTRL
+
+    PAD_IO_MODE                 = 8
+    P                           = 8
+    LLL                         = 8
+    HHH                         = 11
+
+    DACLEVEL                    = 8
+
+    O                           = 14
+    OUT_TRUE                    = 0 << O
+    OUT_INVERT                  = 1 << O
+
+    I                           = 15
+    IN_TRUE                     = 0 << I
+    IN_INVERT                   = 1 << I
+
+    C                           = 16
+    IO_LIVE                     = 0 << C
+    IO_CLOCKED                  = 1 << C
+
+    SMART                       = %000000_0000000 << PAD_IO_MODE
+
+    ADC_GIO_1X                  = %100000_0000000 << PAD_IO_MODE
+    ADC_VIO_1X                  = %100001_0000000 << PAD_IO_MODE
+    ADC_PINB_1X                 = %100010_0000000 << PAD_IO_MODE
+    ADC_PINA_1X                 = %100011_0000000 << PAD_IO_MODE
+    ADC_PINA_3_16X              = %100100_0000000 << PAD_IO_MODE
+    ADC_PINA_10X                = %100101_0000000 << PAD_IO_MODE
+    ADC_PINA_31_6X              = %100110_0000000 << PAD_IO_MODE
+    ADC_PINA_100X               = %100111_0000000 << PAD_IO_MODE
+
+    DAC_990OHM_3V3              = %10100_00000000 << PAD_IO_MODE
+    DAC_600OHM_2V0              = %10101_00000000 << PAD_IO_MODE
+    DAC_123OHM_3V3              = %10110_00000000 << PAD_IO_MODE
+    DAC_75OHM_2V0               = %10111_00000000 << PAD_IO_MODE
+
+    COMP_A_OUT_1K5              = %1100_000000000 << PAD_IO_MODE
+    COMP_A_NOTIN_1K5            = %1101_000000000 << PAD_IO_MODE
+    COMP_B_IN_1K5               = %1110_000000000 << PAD_IO_MODE
+    COMP_B_NOTIN_1K5            = %1111_000000000 << PAD_IO_MODE
+
+    FILTER                      = 21
+    INP_LOGIC                   = 21
+    AB                          = %000 << INP_LOGIC
+    A_AND_B_B                   = %001 << INP_LOGIC
+    A_OR_B_B                    = %010 << INP_LOGIC
+    A_XOR_B_B                   = %011 << INP_LOGIC
+    FILTER_AB_3OF3_CLKDIV1      = %100 << FILTER
+    FILTER_AB_3OF3_CLKDIV8      = %101 << FILTER
+    FILTER_AB_3OF3_CLKDIV64     = %110 << FILTER
+    FILTER_AB_3OF3_CLKDIV512    = %111 << FILTER
+
+    BINP                        = 24
+    BINP_TRUE                   = %0000 << BINP
+    BINP_INVERTED               = %1000 << BINP
+    BINP_THISPIN_READ           = %000 << BINP
+    BINP_RELPLS1_READ           = %001 << BINP
+    BINP_RELPLS2_READ           = %010 << BINP
+    BINP_RELPLS3_READ           = %011 << BINP
+    BINP_THISPIN_OUT            = %100 << BINP
+    BINP_RELMIN3_READ           = %101 << BINP
+    BINP_RELMIN2_READ           = %110 << BINP
+    BINP_RELMIN1_READ           = %111 << BINP
+
+    AINP                        = 28
+    AINP_TRUE                   = %0000 << AINP
+    AINP_INVERTED               = %1000 << AINP
+    AINP_THISPIN_READ           = %000 << AINP
+    AINP_RELPLS1_READ           = %001 << AINP
+    AINP_RELPLS2_READ           = %010 << AINP
+    AINP_RELPLS3_READ           = %011 << AINP
+    AINP_THISPIN_OUT            = %100 << AINP
+    AINP_RELMIN3_READ           = %101 << AINP
+    AINP_RELMIN2_READ           = %110 << AINP
+    AINP_RELMIN1_READ           = %111 << AINP
+
+
+' Sync serial   X[4..0]: Word size, in bits-1 (e.g., If X[4..0] = 7, word size is 8 bits)
+'TX     X[5]: Update mode
+    UPDATE_MODE                 = 5
+    CONTINUOUS                  = 0 << UPDATE_MODE
+    START_STOP                  = 1 << UPDATE_MODE
+
+'RX     X[5]: "A" input sample position relative to the "B" input edge
+    SAMPLE_POS                  = 5
+    SAMPLE_A_BEFORE_B           = 0 << SAMPLE_POS
+    SAMPLE_A_WITH_B             = 1 << SAMPLE_POS
+
+' Smart pin low-pass filter
+    LPF_0                       = $4000_0000                ' filt0
+    LPF_1                       = $4000_0080                ' filt1
+    LPF_2                       = $4000_0100                ' filt2
+    LPF_3                       = $4000_0180                ' filt3
+
+    LPF_LENGTH                  = 5
+    LPF_2FF                     = 0 << LPF_LENGTH           ' 2 flip-flops
+    LPF_3FF                     = 1 << LPF_LENGTH           ' 3 flip-flops
+    LPF_5FF                     = 2 << LPF_LENGTH           ' 5 flip-flops
+    LPF_8FF                     = 3 << LPF_LENGTH           ' 8 flip-flops
+
+PUB Null()
+' This is not a top-level object

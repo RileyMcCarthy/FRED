@@ -1,0 +1,34 @@
+CON
+
+     _xtlfreq   = cfg._xtlfreq
+     _clkfreq   = cfg._clkfreq_def
+
+' -- User-modifiable constants
+    LED         = cfg.LED1
+    SER_RX      = cfg.SER_RX
+    SER_TX      = cfg.SER_TX
+    SER_BAUD    = 2_000_000
+' --
+
+OBJ
+
+    cfg  : "boardcfg.p2eval"
+    term : "com.serial.terminal"
+    str  : "string"
+
+VAR
+
+    byte    str1[64]
+
+PUB Main()
+
+    term.start (SER_BAUD)
+
+    str.copy (@str1, @magicstring)
+    str.replaceall (@str1, string("______"), string("donkey"))
+    term.str (@str1)
+    repeat
+
+DAT
+
+    magicstring     byte    "Mary had a little ______, little ______, little ______",0

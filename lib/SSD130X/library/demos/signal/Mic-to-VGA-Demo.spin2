@@ -1,0 +1,161 @@
+{
+    --------------------------------------------
+    Filename: Mic-to-VGA-Demo.spin2
+    Description: Demo that captures audio from a mic and
+        outputs it directly to attached headphones
+        showing a scope output of the audio on an attached VGA display
+    Author: Jesse Burt
+    Started: May 16, 2020
+    Updated: Oct 31, 2022
+    See end of file for terms of use.
+    --------------------------------------------
+}
+CON
+
+    _xtlfreq        = cfg._xtlfreq
+    _clkfreq        = cfg._clkfreq_def
+
+' -- User-modifiable constants
+    LED             = cfg.LED1
+    SER_BAUD        = 2_000_000
+
+' Parallax A/V Board, P/N 64006H (set AVBOARD_BASE)
+    AVBOARD_BASE    = 48
+
+    VGA_BASE        = AVBOARD_BASE+0
+    MIC_PIN         = 0'AVBOARD_BASE+5
+    SPKR_L          = AVBOARD_BASE+6
+    SPKR_R          = AVBOARD_BASE+7
+
+    SAMPLE_RATE     = 44100
+' CAUTION: Change this line with care. Test with headphones out of ears first,
+'   or with speakers set to a low volume
+    MIC_GAIN        = 1                         ' 1x, 3 (3.16), 10, 100
+' --
+
+    WIDTH           = 320
+    HEIGHT          = 240
+    XMAX            = WIDTH-1
+    YMAX            = HEIGHT-1
+    BUFFSZ          = WIDTH * HEIGHT
+    BPP             = 1
+    BPL             = WIDTH * BPP
+
+    ADC_PERIOD      = _clkfreq / SAMPLE_RATE
+    SCOPE_FACT      = ADC_PERIOD / HEIGHT
+
+OBJ
+
+    ser     : "com.serial.terminal.ansi"
+    cfg     : "boardcfg.p2eval"
+    vga     : "display.vga.bitmap-8bpp"
+    spkr    : "signal.dac.audio"
+    mic     : "signal.adc.audio"
+
+VAR
+
+    long _audio_stack[100], _gfx_stack[100]
+    long _ser_cog, _audio_cog, _vga_cog, _adc_sample
+    byte _framebuffer[BUFFSZ], _offscreen[BUFFSZ]
+
+PUB main() | adc_min, adc_max
+
+    setup()
+    ser.hide_cursor()
+
+    adc_max := 0
+    repeat 500                                  ' Gather some samples to get a
+        adc_min := _adc_sample                  '   "real" minimum
+
+    repeat
+        adc_min := _adc_sample <# adc_min
+        adc_max := adc_max #> _adc_sample
+        ser.pos_xy(0, 4)
+        ser.printf(@"ADC current: %d  \n\rmin: %d  \n\rmax: %d  ", _adc_sample, adc_min, adc_max)
+
+PUB draw_wave() | x, y, y_offset                 ' XXX Rolls - no triggering
+' Draw scope of audio input
+    vga.clear()
+    repeat x from 0 to XMAX
+        y := YMAX-(_adc_sample / SCOPE_FACT)
+        vga.plot(x, y, 191)
+        waitx(ADC_PERIOD)
+
+PUB cog_audio()
+' Sample audio and output it directly to headphones/speakers
+    mic.start(MIC_PIN, SAMPLE_RATE, MIC_GAIN)
+    spkr.start(SPKR_L, SPKR_R, SAMPLE_RATE)
+    repeat
+        _adc_sample := mic.adcsample16()
+        spkr.output16(_adc_sample)
+
+PUB cog_graphics()
+' Run VGA driver and waveform/scope drawing loop
+    vga.set_timings(10, 33, 16, 96, 48, 640)
+    setup_palette()
+    vga.start(VGA_BASE, WIDTH, HEIGHT, @_framebuffer)
+    vga.draw_to(@_offscreen)
+    vga.clear()
+
+    _vga_cog := cogid()                         ' signal 'started' to main cog
+
+    repeat
+        draw_wave()
+        vga.wait_vsync()
+        vga.show()
+
+PUB setup()
+
+    ser.start(SER_BAUD)
+    ser.clear()
+    ser.strln(@"Serial terminal started")
+
+    cogspin(NEWCOG, cog_graphics(), @_gfx_stack)
+    repeat until _vga_cog
+    ser.strln(@"VGA 8bpp driver started")
+
+    cogspin(NEWCOG, cog_audio(), @_audio_stack)
+    repeat until _audio_cog
+    ser.printf(@"Audio cog started (%dHz sample rate)\n\r", SAMPLE_RATE)
+
+PRI setup_palette() | i, r, g, b, c, ptr_pal
+' Set up palette
+    r := g := b := c := 0
+    ptr_pal := vga.palette_ptr()
+    repeat i from 0 to 255
+        case i
+            0..31:
+                r += 4
+                g := 0
+                b += 4
+            32..63:
+                r -= 4
+                g := 0
+                b := b
+            64..95:
+                r := 0
+                g += 4
+                b := b
+            96..127:
+                r := 0
+                g := g
+                b -= 4
+            128..159:
+                r += 4
+                g := g
+                b := b
+            160..191:
+                r := r
+                g -= 4
+                b := 0
+            192..254:
+                r := r
+                g += 4
+                b += 4
+            255:
+                r := g := b := 255
+
+        c := 0 | (r << 16) | (g << 8) | b
+        long[ptr_pal][i] := c
+    long[ptr_pal][0] := $00_00_00_00
+
